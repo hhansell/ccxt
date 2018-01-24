@@ -1,9 +1,9 @@
-"use strict";
+'use strict';
 
 //  ---------------------------------------------------------------------------
 
-const Exchange = require ('./base/Exchange')
-const { ExchangeError } = require ('./base/errors')
+const Exchange = require ('./base/Exchange');
+const { ExchangeError, OrderNotFound } = require ('./base/errors');
 
 //  ---------------------------------------------------------------------------
 
@@ -16,10 +16,14 @@ module.exports = class acx extends Exchange {
             'countries': 'AU',
             'rateLimit': 1000,
             'version': 'v2',
-            'hasCORS': true,
-            'hasFetchTickers': true,
-            'hasFetchOHLCV': true,
-            'hasWithdraw': true,
+            'has': {
+                'CORS': true,
+                'fetchTickers': true,
+                'fetchOHLCV': true,
+                'fetchOpenOrders': true,
+				'fetchOrder': true,
+                'withdraw': true,
+            },
             'timeframes': {
                 '1m': '1',
                 '5m': '5',
@@ -73,6 +77,19 @@ module.exports = class acx extends Exchange {
                         'order/delete', // Cancel an order
                         'withdraw', // Create a withdraw
                     ],
+                },
+            },
+            'fees': {
+                'trading': {
+                    'tierBased': false,
+                    'percentage': true,
+                    'maker': 0.0,
+                    'taker': 0.0,
+                },
+                'funding': {
+                    'tierBased': false,
+                    'percentage': true,
+                    'withdraw': 0.0, // There is only 1% fee on withdrawals to your bank account.
                 },
             },
         });
@@ -180,7 +197,7 @@ module.exports = class acx extends Exchange {
                 quote = quote.toUpperCase ();
                 base = this.commonCurrencyCode (base);
                 quote = this.commonCurrencyCode (quote);
-                let symbol = base + '/' + quote;
+                symbol = base + '/' + quote;
             }
             let ticker = tickers[id];
             result[symbol] = this.parseTicker (ticker, market);
@@ -198,18 +215,18 @@ module.exports = class acx extends Exchange {
     }
 
     parseTrade (trade, market = undefined) {
-        let timestamp = trade['timestamp'] * 1000;
-        let side = (trade['type'] == 'bid') ? 'buy' : 'sell';
+        let timestamp = this.parse8601 (trade['created_at']);
         return {
-            'info': trade,
-            'id': trade['tid'].toString (),
+            'id': trade['id'].toString (),
             'timestamp': timestamp,
             'datetime': this.iso8601 (timestamp),
             'symbol': market['symbol'],
             'type': undefined,
-            'side': side,
-            'price': trade['price'],
-            'amount': trade['amount'],
+            'side': undefined,
+            'price': this.safeFloat (trade, 'price'),
+            'amount': this.safeFloat (trade, 'volume'),
+            'cost': this.safeFloat (trade, 'funds'),
+            'info': trade,
         };
     }
 
@@ -219,10 +236,7 @@ module.exports = class acx extends Exchange {
         let response = await this.publicGetTrades (this.extend ({
             'market': market['id'],
         }, params));
-        // looks like they switched this endpoint off
-        // it returns 503 Service Temporarily Unavailable always
-        // return this.parseTrades (response, market);
-        return response;
+        return this.parseTrades (response, market, since, limit);
     }
 
     parseOHLCV (ohlcv, market = undefined, timeframe = '1m', since = undefined, limit = undefined) {
@@ -252,14 +266,29 @@ module.exports = class acx extends Exchange {
         return this.parseOHLCVs (response, market, timeframe, since, limit);
     }
 
-    parseOrder (order, market) {
-        let symbol = market['symbol'];
+    parseOrder (order, market = undefined) {
+        let symbol = undefined;
+        if (market) {
+            symbol = market['symbol'];
+        } else {
+            let marketId = order['market'];
+            symbol = this.marketsById[marketId]['symbol'];
+        }
         let timestamp = this.parse8601 (order['created_at']);
+        let state = order['state'];
+        let status = undefined;
+        if (state === 'done') {
+            status = 'closed';
+        } else if (state === 'wait') {
+            status = 'open';
+        } else if (state === 'cancel') {
+            status = 'canceled';
+        }
         return {
-            'id': order['id'],
+            'id': order['id'].toString(),
             'timestamp': timestamp,
             'datetime': this.iso8601 (timestamp),
-            'status': 'open',
+            'status': status,
             'symbol': symbol,
             'type': order['ord_type'],
             'side': order['side'],
@@ -273,6 +302,30 @@ module.exports = class acx extends Exchange {
         };
     }
 
+    async fetchOpenOrders (symbol = undefined, since = undefined, limit = undefined, params = {}) {
+        if (!symbol)
+            throw new ExchangeError (this.id + ' fetchOpenOrders requires a symbol param');
+        await this.loadMarkets ();
+        let market = this.market (symbol);
+        let response = await this.privateGetOrders ({
+            'market': market['id']
+        }, params);
+        let openOrders = this.parseOrders (response, market);
+        return this.filterBySinceLimit (openOrders, since, limit);
+    }
+	
+	
+    async fetchOrder (id, symbol = undefined, params = {}) {
+        if (!id)
+            throw new ExchangeError (this.id + ' fetchOrder requires a id param');
+        let market = this.market (symbol);
+		let response = await this.privateGetOrder ({
+            'id': id
+        }, params);
+        let order = this.parseOrder (response, market);
+        return order;
+    }
+
     async createOrder (symbol, type, side, amount, price = undefined, params = {}) {
         await this.loadMarkets ();
         let order = {
@@ -281,7 +334,7 @@ module.exports = class acx extends Exchange {
             'volume': amount.toString (),
             'ord_type': type,
         };
-        if (type == 'limit') {
+        if (type === 'limit') {
             order['price'] = price.toString ();
         }
         let response = await this.privatePostOrders (this.extend (order, params));
@@ -291,10 +344,15 @@ module.exports = class acx extends Exchange {
 
     async cancelOrder (id, symbol = undefined, params = {}) {
         await this.loadMarkets ();
-        return await this.privatePostOrderDelete ({ 'id': id });
+        let result = await this.privatePostOrderDelete ({ 'id': id });
+        let order = this.parseOrder (result);
+        if (order['status'] === 'closed') {
+            throw new OrderNotFound (this.id + ' ' + result);
+        }
+        return order;
     }
 
-    async withdraw (currency, amount, address, params = {}) {
+    async withdraw (currency, amount, address, tag = undefined, params = {}) {
         await this.loadMarkets ();
         let result = await this.privatePostWithdraw (this.extend ({
             'currency': currency.toLowerCase (),
@@ -311,26 +369,45 @@ module.exports = class acx extends Exchange {
         return this.milliseconds ();
     }
 
+    encodeParams (params) {
+        if ('orders' in params) {
+            let orders = params['orders'];
+            let query = this.urlencode (this.keysort (this.omit (params, 'orders')));
+            for (let i = 0; i < orders.length; i++) {
+                let order = orders[i];
+                let keys = Object.keys (order);
+                for (let k = 0; k < keys.length; k++) {
+                    let key = keys[k];
+                    let value = order[key];
+                    query += '&orders%5B%5D%5B' + key + '%5D=' + value.toString ();
+                }
+            }
+            return query;
+        }
+        return this.urlencode (this.keysort (params));
+    }
+
     sign (path, api = 'public', method = 'GET', params = {}, headers = undefined, body = undefined) {
         let request = '/api' + '/' + this.version + '/' + this.implodeParams (path, params);
         if ('extension' in this.urls)
             request += this.urls['extension'];
         let query = this.omit (params, this.extractParams (path));
         let url = this.urls['api'] + request;
-        if (api == 'public') {
-            if (Object.keys (query).length)
+        if (api === 'public') {
+            if (Object.keys (query).length) {
                 url += '?' + this.urlencode (query);
+            }
         } else {
             this.checkRequiredCredentials ();
             let nonce = this.nonce ().toString ();
-            let query = this.urlencode (this.keysort (this.extend ({
+            let query = this.encodeParams (this.extend ({
                 'access_key': this.apiKey,
                 'tonce': nonce,
-            }, params)));
+            }, params));
             let auth = method + '|' + request + '|' + query;
             let signature = this.hmac (this.encode (auth), this.encode (this.secret));
             let suffix = query + '&signature=' + signature;
-            if (method == 'GET') {
+            if (method === 'GET') {
                 url += '?' + suffix;
             } else {
                 body = suffix;
